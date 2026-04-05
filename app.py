@@ -169,36 +169,49 @@ Syntax: PU_COUNT( target_table, source_table.column [, filter_expression] )
 - Returns 0 (not NULL) when no matching rows — unique among PU functions
 - PREFER over PU_COUNT_DISTINCT when column is already a key (much faster)
 - PU_COUNT IGNORES global filters — use filter_expression for filter-aware counts
-- Example: PU_COUNT("CASES", "ACTIVITIES"."CASE_ID", "ACTIVITIES"."ACTIVITY" = 'Approve')''',
+- filter_expression is a RAW boolean expression — NEVER wrap with FILTER()
+- CORRECT: PU_COUNT("CASES", "ACTIVITIES"."CASE_ID", "ACTIVITIES"."ACTIVITY" = 'Approve')
+- WRONG:   PU_COUNT("CASES", "ACTIVITIES"."CASE_ID", FILTER("ACTIVITIES"."ACTIVITY" = 'Approve'))''',
 
     'PU_SUM': '''Sums source column per target row.
 Syntax: PU_SUM( target_table, source_table.column [, filter_expression] )
 - Returns NULL (not 0) when no matching rows
 - PU_COUNT is cheaper than PU_SUM for counting
-- Example: PU_SUM("VENDORS", "ORDERS"."AMOUNT")''',
+- filter_expression is a RAW boolean expression — NEVER wrap with FILTER()
+- CORRECT: PU_SUM("VENDORS", "ORDERS"."AMOUNT", "ORDERS"."STATUS" = 'Open')
+- WRONG:   PU_SUM("VENDORS", "ORDERS"."AMOUNT", FILTER("ORDERS"."STATUS" = 'Open'))''',
 
     'PU_AVG': '''Average of source column per target row. Always returns FLOAT.
 Syntax: PU_AVG( target_table, source_table.column [, filter_expression] )
 - MUCH cheaper than PU_MEDIAN — prefer PU_AVG unless true median required
-- Example: PU_AVG("VENDORS", "ORDERS"."LEAD_TIME_DAYS")''',
+- filter_expression is a RAW boolean expression — NEVER wrap with FILTER()
+- CORRECT: PU_AVG("VENDORS", "ORDERS"."LEAD_TIME_DAYS", "ORDERS"."STATUS" = 'Open')
+- WRONG:   PU_AVG("VENDORS", "ORDERS"."LEAD_TIME_DAYS", FILTER("ORDERS"."STATUS" = 'Open'))''',
 
     'PU_MAX': '''Maximum of source column per target row.
 Syntax: PU_MAX( target_table, source_table.column [, filter_expression] )
-- Returns NULL when no matching rows''',
+- Returns NULL when no matching rows
+- filter_expression is a RAW boolean expression — NEVER wrap with FILTER()''',
 
     'PU_MIN': '''Minimum of source column per target row.
 Syntax: PU_MIN( target_table, source_table.column [, filter_expression] )
-- Returns NULL when no matching rows''',
+- Returns NULL when no matching rows
+- filter_expression is a RAW boolean expression — NEVER wrap with FILTER()''',
 
     'PU_FIRST': '''Returns first element of source column for each target row.
-Syntax: PU_FIRST( target_table, source_table.column [, filter_expression] [, ORDER BY col [ASC|DESC]] )
+Syntax: PU_FIRST( target_table, source_table.column [, filter_expression] [, ORDER BY source_table.column [ASC|DESC]] )
 - ALWAYS use explicit ORDER BY
-- Example: PU_FIRST("CASES", "ACTIVITIES"."TIMESTAMP", ORDER BY "ACTIVITIES"."TIMESTAMP" ASC)''',
+- filter_expression is a RAW boolean expression — NEVER wrap with FILTER()
+- CORRECT: PU_FIRST("CASES", "ACTIVITIES"."TIMESTAMP", "ACTIVITIES"."ACTIVITY" = 'Create', ORDER BY "ACTIVITIES"."TIMESTAMP" ASC)
+- WRONG:   PU_FIRST("CASES", "ACTIVITIES"."TIMESTAMP", FILTER("ACTIVITIES"."ACTIVITY" = 'Create'), ORDER BY "ACTIVITIES"."TIMESTAMP" ASC)
+- No-filter example: PU_FIRST("CASES", "ACTIVITIES"."TIMESTAMP", ORDER BY "ACTIVITIES"."TIMESTAMP" ASC)''',
 
     'PU_LAST': '''Returns last element of source column for each target row.
-Syntax: PU_LAST( target_table, source_table.column [, filter_expression] [, ORDER BY col [ASC|DESC]] )
+Syntax: PU_LAST( target_table, source_table.column [, filter_expression] [, ORDER BY source_table.column [ASC|DESC]] )
 - ALWAYS use explicit ORDER BY
-- Example: PU_LAST("CASES", "ACTIVITIES"."TIMESTAMP", ORDER BY "ACTIVITIES"."TIMESTAMP" ASC)''',
+- filter_expression is a RAW boolean expression — NEVER wrap with FILTER()
+- CORRECT: PU_LAST("CASES", "ACTIVITIES"."TIMESTAMP", "ACTIVITIES"."ACTIVITY" = 'Close', ORDER BY "ACTIVITIES"."TIMESTAMP" ASC)
+- WRONG:   PU_LAST("CASES", "ACTIVITIES"."TIMESTAMP", FILTER("ACTIVITIES"."ACTIVITY" = 'Close'), ORDER BY "ACTIVITIES"."TIMESTAMP" ASC)''',
 
     'PU_MEDIAN':         'Median per target row. Expensive — use PU_AVG when possible.\nSyntax: PU_MEDIAN( target_table, source_table.column [, filter_expression] )',
     'PU_COUNT_DISTINCT': 'Distinct count per target row. USE PU_COUNT if column is already a key.\nSyntax: PU_COUNT_DISTINCT( target_table, source_table.column [, filter_expression] )',
@@ -491,6 +504,18 @@ _FUNCTION_GUIDE = """
 | Detect rework | INDEX_ACTIVITY_LOOP > 0 | Custom logic |
 | Prevent join multiply | GLOBAL( aggregation ) | — |
 
+## CRITICAL — PU Function Filter Syntax
+The filter_expression in PU functions is a RAW boolean expression — NEVER a FILTER() call.
+
+CORRECT — filter_expression without FILTER() wrapper:
+  PU_FIRST("CASES", "ACTIVITIES"."TIMESTAMP", "ACTIVITIES"."ACTIVITY" = 'Create', ORDER BY "ACTIVITIES"."TIMESTAMP" ASC)
+  PU_COUNT("CASES", "ACTIVITIES"."CASE_ID", "ACTIVITIES"."ACTIVITY" = 'Approve')
+  PU_SUM("VENDORS", "ORDERS"."AMOUNT", "ORDERS"."STATUS" = 'Open')
+
+WRONG — NEVER wrap the filter in FILTER():
+  PU_FIRST("CASES", "ACTIVITIES"."TIMESTAMP", FILTER("ACTIVITIES"."ACTIVITY" = 'Create'), ...)
+  PU_COUNT("CASES", "ACTIVITIES"."CASE_ID", FILTER("ACTIVITIES"."ACTIVITY" = 'Approve'))
+
 ## NULL Behaviour
 | Function | No matching rows |
 |----------|-----------------|
@@ -533,9 +558,22 @@ def build_pql_system_prompt(complexity: str, show_reasoning: bool) -> str:
     return base
 
 VERIFICATION_SYSTEM = """You are a strict Celonis PQL validator. Review PQL and fix errors.
-Rules: No SQL keywords (SELECT/FROM/JOIN/GROUP BY). All identifiers double-quoted.
-PU functions need 2+ args. CALC_THROUGHPUT with aggregations → wrap in GLOBAL().
-If correct: respond exactly VALID. If errors: return corrected ```pql block + bullet fixes."""
+
+Rules to enforce:
+1. No SQL keywords (SELECT/FROM/JOIN/GROUP BY/HAVING). PQL is NOT SQL.
+2. All table/column identifiers must be double-quoted: "TABLE"."COLUMN"
+3. String literals use single quotes: 'value'
+4. PU functions need at least 2 arguments: PU_X(target_table, source_table.column)
+5. CALC_THROUGHPUT with aggregations (AVG/COUNT/SUM) → must be wrapped in GLOBAL()
+6. CRITICAL: The filter_expression inside PU functions must be a RAW boolean expression.
+   NEVER wrap it with FILTER(). 
+   WRONG:   PU_FIRST("CASES", "ACTIVITIES"."TS", FILTER("ACTIVITIES"."ACT" = 'X'), ORDER BY ...)
+   CORRECT: PU_FIRST("CASES", "ACTIVITIES"."TS", "ACTIVITIES"."ACT" = 'X', ORDER BY ...)
+   This applies to ALL PU functions: PU_COUNT, PU_SUM, PU_AVG, PU_MIN, PU_MAX, PU_FIRST, PU_LAST, etc.
+7. FILTER is a standalone PQL statement — it is never used as a function call inside another function.
+
+If correct: respond exactly VALID.
+If errors: return corrected ```pql block + brief bullet list of fixes."""
 
 def extract_pql_blocks(text: str) -> list[str]:
     return re.findall(r"```pql\s*(.*?)```", text, re.S)
@@ -549,6 +587,11 @@ def verify_pql(pql_query: str, complexity: str) -> tuple[bool, str, list[str]]:
     if 'CALC_THROUGHPUT' in pql_query and 'GLOBAL(' not in pql_query:
         if re.search(r'\b(AVG|COUNT|SUM|MEDIAN)\b', pql_query):
             issues.append("CALC_THROUGHPUT mixed with aggregations — consider GLOBAL()")
+    # Detect FILTER() used as a function inside a PU function (major syntax error)
+    if re.search(r'PU_\w+\s*\([^)]*FILTER\s*\(', pql_query, re.IGNORECASE):
+        issues.append("CRITICAL: FILTER() used as a function inside a PU function. "
+                       "The filter_expression must be a raw boolean: "
+                       "e.g. \"ACTIVITIES\".\"ACTIVITY\" = 'Create' not FILTER(...)")
     if not issues and complexity not in ('Advanced', 'Expert'):
         return False, pql_query, []
     try:
