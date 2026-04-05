@@ -100,6 +100,46 @@ def record_tokens(p: int, r: int):
     st.session_state.token_stats["total"]    += p + r
     st.session_state.token_stats["turns"]    += 1
 
+# Model context limits (conservative — leave room for system prompt + response)
+MODEL_TOKEN_LIMITS = {
+    "compound-beta":                                  8_000,
+    "llama-3.3-70b-versatile":                       16_000,
+    "meta-llama/llama-4-scout-17b-16e-instruct":     16_000,
+    "mixtral-8x7b-32768":                            24_000,
+    "llama-3.1-8b-instant":                          12_000,
+}
+
+def trim_history(messages: list[dict], system_prompt: str, model: str, max_response: int = 1500) -> list[dict]:
+    """
+    Trim conversation history so total tokens stay within model limits.
+    Always keeps the most recent messages. Removes oldest first.
+    """
+    limit      = MODEL_TOKEN_LIMITS.get(model, 10_000)
+    budget     = limit - count_tokens(system_prompt) - max_response - 200  # 200 safety buffer
+    budget     = max(budget, 1000)  # always keep at least some history
+
+    # Walk from newest to oldest, keeping messages that fit
+    kept   = []
+    used   = 0
+    for msg in reversed(messages):
+        tokens = count_tokens(msg.get("content", "")) + 4
+        if used + tokens > budget:
+            break
+        kept.append(msg)
+        used += tokens
+
+    kept.reverse()
+    # Always keep at least the last exchange (last 2 messages)
+    if not kept and len(messages) >= 2:
+        kept = messages[-2:]
+    elif not kept and messages:
+        kept = messages[-1:]
+
+    trimmed = len(messages) - len(kept)
+    if trimmed > 0:
+        _log("info", f"History trimmed: removed {trimmed} old messages to fit context window")
+    return kept
+
 def cost_estimate(tokens: int) -> str:
     c = (tokens / 1_000_000) * 0.59
     return f"~${c:.5f}" if c < 0.001 else f"~${c:.4f}"
@@ -1104,7 +1144,6 @@ with right_col:
         else:
             st.session_state.agent_messages = messages
 
-        history = [{"role": m["role"], "content": m["content"]} for m in messages[-20:]]
         avatar_ai = "📝" if app_mode == "pql" else "🤖"
 
         with st.chat_message("assistant", avatar=avatar_ai):
@@ -1112,12 +1151,16 @@ with right_col:
 
             # ── PQL MODE ──────────────────────────────────────
             if app_mode == "pql":
-                func_ctx    = build_function_context(prompt)
-                system      = build_pql_system_prompt(complexity, show_rsn)
+                func_ctx = build_function_context(prompt)
+                system   = build_pql_system_prompt(complexity, show_rsn)
                 if func_ctx:
                     system += f"\n\n## Relevant Functions (auto-retrieved)\n{func_ctx}"
 
-                p_tokens = count_tokens(system) + count_tokens(prompt)
+                # Trim history to fit within model context window
+                prior    = [{"role": m["role"], "content": m["content"]} for m in messages[:-1]]
+                history  = trim_history(prior, system, "llama-3.3-70b-versatile", 2048)
+                history  = history + [{"role": "user", "content": prompt}]
+                p_tokens = count_tokens(system) + sum(count_tokens(m["content"]) for m in history)
 
                 try:
                     stream = Groq(api_key=GROQ_KEY).chat.completions.create(
@@ -1170,7 +1213,10 @@ with right_col:
                 except groq_errors.RateLimitError:
                     st.error("⏳ Groq rate limit hit — wait and retry.")
                 except Exception as e:
-                    st.error(f"⚠️ Error: {e}")
+                    if "413" in str(e) or "too large" in str(e).lower() or "entity" in str(e).lower():
+                        st.error("⚠️ Conversation too long for this model's context window. Click **🗑️ Clear Chat** in the panel to start fresh.")
+                    else:
+                        st.error(f"⚠️ Error: {e}")
 
             # ── AGENT MODE ────────────────────────────────────
             else:
@@ -1183,8 +1229,13 @@ with right_col:
                         search_results = search_celonis(prompt)
                         search_ctx     = format_search_ctx(search_results)
 
-                system   = build_agent_prompt(answer_mode, search_ctx)
-                p_tokens = count_tokens(system) + count_tokens(prompt)
+                system = build_agent_prompt(answer_mode, search_ctx)
+
+                # Trim history to fit within model context window
+                prior   = [{"role": m["role"], "content": m["content"]} for m in messages[:-1]]
+                history = trim_history(prior, system, selected_model, 1500)
+                history = history + [{"role": "user", "content": prompt}]
+                p_tokens = count_tokens(system) + sum(count_tokens(m["content"]) for m in history)
 
                 try:
                     stream = Groq(api_key=GROQ_KEY).chat.completions.create(
@@ -1226,5 +1277,8 @@ with right_col:
                 except groq_errors.RateLimitError:
                     st.error("⏳ Groq rate limit hit — wait and retry.")
                 except Exception as e:
-                    _log("error", f"Agent error: {e}")
-                    st.error(f"⚠️ Error: {e}")
+                    if "413" in str(e) or "too large" in str(e).lower() or "entity" in str(e).lower():
+                        st.error("⚠️ Conversation too long. Click **🗑️ Clear Chat** in the panel to start fresh, or switch to a model with a larger context window (Mixtral 8x7B has 32K tokens).")
+                    else:
+                        _log("error", f"Agent error: {e}")
+                        st.error(f"⚠️ Error: {e}")
